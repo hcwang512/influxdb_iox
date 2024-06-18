@@ -12,6 +12,8 @@ use std::{
         Arc,
     },
 };
+use lazy_static::lazy_static;
+use libc as _;
 
 /// Defines the desired maximum size of the re-used write
 /// [`OpenSegmentFileWriter`] buffer.
@@ -24,6 +26,12 @@ use std::{
 /// amount of memory overhead for the lifetime of the writer.
 const SOFT_MAX_BUFFER_LEN: usize = 1024 * 128; // 128kiB
 
+const PREALLOCATE_SIZE: usize = 16 * 1024; // preallocate every 16KB
+
+lazy_static! {
+    static ref ZEROS: Vec<u8> = vec![0; PREALLOCATE_SIZE];
+}
+
 /// Struct for writing data to a segment file in a wal
 #[derive(Debug)]
 pub struct OpenSegmentFileWriter {
@@ -31,6 +39,7 @@ pub struct OpenSegmentFileWriter {
     path: PathBuf,
     f: File,
     bytes_written: usize,
+    allocated_length: usize,
 
     buffer: Vec<u8>,
 }
@@ -57,17 +66,21 @@ impl OpenSegmentFileWriter {
         f.write_all(&id_bytes).context(SegmentWriteIdSnafu)?;
         let id_bytes_written = id_bytes.len();
 
-        f.sync_all().expect("fsync failure");
+        // f.sync_all().expect("fsync failure");
 
         let bytes_written = file_type_bytes_written + id_bytes_written;
 
-        Ok(Self {
+        let mut writer = Self {
             id,
             path,
             f,
             bytes_written,
+            allocated_length: 0,
             buffer: Vec::with_capacity(8 * 1204), // 8kiB initial size
-        })
+        };
+        writer.sync_range(0, bytes_written)?;
+
+        Ok(writer)
     }
 
     pub fn id(&self) -> SegmentId {
@@ -125,15 +138,63 @@ impl OpenSegmentFileWriter {
         self.f.write_all(buf).context(SegmentWriteDataSnafu)?;
 
         // fsync the fd
-        self.f.sync_all().expect("fsync failure");
+        // self.f.sync_all().expect("fsync failure");
 
         self.bytes_written += bytes_written;
+        self.sync_range(self.bytes_written-bytes_written, bytes_written)?;
 
         Ok(WriteSummary {
             total_bytes: self.bytes_written,
             bytes_written,
             segment_id: self.id,
         })
+    }
+
+    #[cfg(target_os="linux")]
+    fn sync_range(&mut self, offset: usize, size: usize) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+        use std::os::fd::AsRawFd;
+        match self.bytes_written.checked_sub(self.allocated_length) {
+            Some(zeros_needed) if zeros_needed > 0 => {
+                // need to allocate more pages
+                let to_allocate_pages = (self.bytes_written - self.allocated_length) / PREALLOCATE_SIZE;
+
+                for _ in 0..=to_allocate_pages {
+                    self.allocated_length += PREALLOCATE_SIZE;
+                    self.f.write_all(&ZEROS).context(SegmentWriteDataSnafu)?;
+                }
+                self.f.sync_data().context(SegmentWriteDataSnafu)?;
+                self.f.seek(SeekFrom::Start(self.bytes_written as u64)).context(SegmentWriteDataSnafu)?;
+            }
+            _ => {
+
+                let result = unsafe {
+                    libc::sync_file_range(
+                        self.f.as_raw_fd(),
+                        offset as i64,
+                        size as i64,
+                        libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                            | libc::SYNC_FILE_RANGE_WRITE
+                            | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+                    )
+                };
+                if result != 0 {
+                    return Err(Error::SegmentWriteData {
+                        source: io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("failed to sync file range, result: {result:?}")
+                        )});
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os="linux"))]
+    fn sync_range(&mut self, _offset: usize, _size: usize) -> Result<()>{
+        // use fdatasync, which provides persistence guarantees but won't update all file metadata,
+        // to reduce disk operations.
+        Ok(self.f.sync_data().context(SegmentWriteDataSnafu)?)
     }
 
     pub fn close(self) -> Result<ClosedSegment> {
