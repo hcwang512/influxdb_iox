@@ -223,6 +223,9 @@ pub struct Wal {
 
     /// The handle to the [`Wal::flush_buffer_background_task()`] task.
     flusher_task: Mutex<Option<JoinHandle<()>>>,
+
+    notify_write: watch::Sender<()>,
+    // write_rx: watch::Receiver<()>,
 }
 
 impl Wal {
@@ -297,6 +300,7 @@ impl Wal {
 
         let buffer = WalBuffer::new(None);
 
+        let (tx, mut rx) = watch::channel(());
         let wal = Self {
             root,
             segments: Arc::new(Mutex::new(Segments {
@@ -307,6 +311,8 @@ impl Wal {
             next_id_source,
             buffer: Mutex::new(buffer),
             flusher_task: Default::default(),
+            // write_rx: rx,
+            notify_write: tx,
         };
 
         let wal = Arc::new(wal);
@@ -314,7 +320,7 @@ impl Wal {
 
         // Retain the handle to the flusher task so it can be stopped later.
         *wal.flusher_task.lock() = Some(tokio::task::spawn(async move {
-            flush_wal.flush_buffer_background_task().await
+            flush_wal.flush_buffer_background_task(rx).await
         }));
 
         Ok(wal)
@@ -337,6 +343,7 @@ impl Wal {
     pub fn write_op(&self, op: SequencedWalOp) -> watch::Receiver<Option<WriteResult>> {
         let mut b = self.buffer.lock();
         b.ops.push(op);
+        let _ = self.notify_write.send(());
         b.flush_notification.clone()
     }
 
@@ -363,7 +370,7 @@ impl Wal {
         Ok((closed, seqnum_set))
     }
 
-    async fn flush_buffer_background_task(&self) {
+    async fn flush_buffer_background_task(&self, mut write_rx: watch::Receiver<()> ) {
         // Start a separate I/O thread to handle the serialisation, compression,
         // and actual file I/O.
         //
@@ -373,7 +380,7 @@ impl Wal {
         // When this handle is dropped, the I/O thread is gracefully stopped.
         let io_thread = WriterIoThreadHandle::new(Arc::clone(&self.segments));
 
-        let mut interval = tokio::time::interval(WAL_FLUSH_INTERVAL);
+        // let mut interval = tokio::time::interval(WAL_FLUSH_INTERVAL);
 
         // Pre-allocate the WAL buffer outside of the exclusive lock, and track
         // the buffer utilisation to optimise pre-allocation.
@@ -381,7 +388,8 @@ impl Wal {
         let mut new_buf = WalBuffer::new(size_hint);
 
         loop {
-            interval.tick().await;
+            // interval.tick().await;
+            write_rx.changed().await.expect("failed to receive write ops");
 
             // Rust's move properties ensure we never accidentally reuse a
             // buffer, but make it clear the buffer is always fresh before use.
