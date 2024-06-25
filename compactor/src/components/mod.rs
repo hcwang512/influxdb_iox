@@ -54,6 +54,7 @@ pub struct Components {
     pub partition_files_source: Arc<dyn PartitionFilesSource>,
     /// Determines what type of compaction round the compactor will be doing
     pub round_info_source: Arc<dyn RoundInfoSource>,
+    pub tiered_round_info_source: Arc<dyn RoundInfoSource>,
     /// stop condition for completing a partition compaction
     pub partition_filter: Arc<dyn PartitionFilter>,
     /// condition to avoid running out of resources during compaction
