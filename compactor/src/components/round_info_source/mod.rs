@@ -1,3 +1,7 @@
+mod tiered_round_info;
+
+pub use tiered_round_info::TieredRoundInfo;
+
 use std::{
     cmp::max,
     fmt::{Debug, Display},

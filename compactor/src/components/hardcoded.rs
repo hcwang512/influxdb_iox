@@ -71,7 +71,7 @@ use super::{
         metrics::MetricsPostClassificationFilterWrapper, possible_progress::PossibleProgressFilter,
         PostClassificationPartitionFilter,
     },
-    round_info_source::{LevelBasedRoundInfo, LoggingRoundInfoWrapper, RoundInfoSource},
+    round_info_source::{LevelBasedRoundInfo, LoggingRoundInfoWrapper, RoundInfoSource, TieredRoundInfo},
     round_split::many_files::ManyFilesRoundSplit,
     scratchpad::{noop::NoopScratchpadGen, prod::ProdScratchpadGen, ScratchpadGen},
     split_or_compact::{
@@ -98,6 +98,7 @@ pub fn hardcoded_components(config: &Config) -> Arc<Components> {
         compaction_job_stream: make_compaction_job_stream(config, compaction_jobs_source),
         partition_info_source: make_partition_info_source(config),
         partition_files_source: make_partition_files_source(config),
+        tiered_round_info_source: make_tiered_round_info_source(config),
         round_info_source: make_round_info_source(config),
         partition_filter: make_partition_filter(config),
         compaction_job_done_sink,
@@ -214,6 +215,15 @@ fn make_partition_files_source(config: &Config) -> Arc<dyn PartitionFilesSource>
             Arc::clone(&config.catalog),
         )),
     }
+}
+
+fn make_tiered_round_info_source(config: &Config) -> Arc<dyn RoundInfoSource> {
+    Arc::new(
+        TieredRoundInfo {
+            max_file_size: config.max_desired_file_size_bytes as usize,
+            max_file_size_to_group: config.max_compact_size_bytes(),
+        }
+    )
 }
 
 fn make_round_info_source(config: &Config) -> Arc<dyn RoundInfoSource> {

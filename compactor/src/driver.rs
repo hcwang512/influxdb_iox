@@ -21,11 +21,13 @@ use crate::{
         Components,
     },
     error::{DynError, ErrorKind, ErrorKindExt, SimpleError},
-    file_classification::{FileClassification, FilesForProgress},
+    file_classification::{FileClassification, FilesForProgress, FilesToSplitOrCompact},
     partition_info::PartitionInfo,
     round_info::CompactType,
     PlanIR, RoundInfo,
 };
+// use crate::components::split_or_compact::split_compact::SplitCompact;
+use crate::file_classification::CompactReason;
 
 /// Tries to compact all eligible partitions, up to
 /// partition_concurrency at a time.
@@ -74,26 +76,36 @@ async fn compact_partition(
     gossip_handle: Option<Arc<CompactionEventTx>>,
 ) {
     let partition_id = job.partition_id;
+    let compact_job = job.clone();
     info!(partition_id = partition_id.get(), timeout = ?partition_timeout, "compact partition",);
     span.set_metadata("partition_id", partition_id.get().to_string());
     let scratchpad = components.scratchpad_gen.pad();
+    let scratchpad_clone = scratchpad.clone();
 
     info!(partition_id = partition_id.get(), "compaction job starting");
 
     let res = timeout_with_progress_checking(partition_timeout, |transmit_progress_signal| {
-        let components = Arc::clone(&components);
-        let scratchpad = Arc::clone(&scratchpad);
-        async {
+        let components_level = Arc::clone(&components);
+        let components_tiered = Arc::clone(&components);
+        let scratchpad_level = Arc::clone(&scratchpad);
+        let gossip = gossip_handle.clone();
+        async move {
             try_compact_partition(
-                span,
+                span.child("level"),
                 job.clone(),
-                df_semaphore,
-                components,
-                scratchpad,
+                df_semaphore.clone(),
+                components_level,
+                scratchpad_level,
                 transmit_progress_signal,
                 gossip_handle,
             )
-            .await // errors detected in the CompactionJob update_job_status(), will be handled in the timeout_with_progress_checking
+            .await?; // errors detected in the CompactionJob update_job_status(), will be handled in the timeout_with_progress_checking
+            tiered_l2_compaction(
+                span.child("tiered"), components_tiered,
+                job.clone(),
+                Arc::clone(&df_semaphore), Arc::clone(&scratchpad),
+                gossip,
+            ).await
         }
     })
     .await;
@@ -117,9 +129,9 @@ async fn compact_partition(
     };
 
     // TODO: how handle errors detected in the CompactionJob ending actions?
-    let _ = components.compaction_job_done_sink.record(job, res).await;
+    let _ = components.compaction_job_done_sink.record(compact_job, res).await;
 
-    scratchpad.clean().await;
+    scratchpad_clone.clean().await;
     info!(partition_id = partition_id.get(), "compaction job done",);
 }
 
@@ -347,7 +359,109 @@ async fn try_compact_partition(
                 .replace(files_for_later);
         }
         last_round_info = Some(round_info);
+    };
+
+}
+
+async fn tiered_l2_compaction(
+    span: SpanRecorder,
+    components: Arc<Components>,
+    job: CompactionJob,
+    df_semaphore: Arc<InstrumentedAsyncSemaphore>,
+    scratchpad_ctx: Arc<dyn Scratchpad>,
+    gossip_handle: Option<Arc<CompactionEventTx>>,
+) -> Result<(), DynError> {
+    let partition_info = components.partition_info_source.fetch(job.partition_id).await?;
+    let mut files = components.partition_files_source.fetch(job.partition_id).await;
+    files.sort_by_key(|f| f.min_time);
+    let ( round_info, _ ) = components.tiered_round_info_source.calculate(
+        Arc::clone(&components), None, &partition_info, df_semaphore.total_permits(), files).await?;
+
+    for range in &round_info.ranges {
+        let l2s = range.files_for_now.lock().unwrap().take().unwrap();
+        let scratchpad = Arc::clone(&scratchpad_ctx);
+        let components = Arc::clone(&components);
+        let branch_span = span.child("branch");
+        let gossip_handle = gossip_handle.clone();
+        {
+            let split_or_compact = FilesToSplitOrCompact::Compact(l2s.clone(), CompactReason::TotalSizeLessThanMaxCompactSize);
+            let paths = split_or_compact.file_input_paths();
+            let object_store_ids = scratchpad.uuids(&paths);
+
+            let plans = components.ir_planner.create_plans(
+                Arc::clone(&partition_info),
+                CompactionLevel::Final,
+                split_or_compact.clone(),
+                object_store_ids,
+                paths,
+            );
+            let mut chunks = plans.into_iter().peekable();
+            let saved_parquet_file_state = SavedParquetFileState::from(&l2s);
+            while chunks.peek().is_some() {
+                let chunk: Vec<PlanIR> = chunks
+                    .by_ref()
+                    .take(df_semaphore.total_permits() * 4)
+                    .collect();
+
+                let files_to_delete = chunk
+                    .iter()
+                    .flat_map(|plan| plan.input_parquet_files())
+                    .collect::<Vec<_>>();
+
+                // Compact & Split
+                let created_file_params = run_plans(
+                    branch_span.child("run_plans"),
+                    chunk,
+                    &partition_info,
+                    &components,
+                    Arc::clone(&df_semaphore),
+                    Arc::<dyn Scratchpad>::clone(&scratchpad_ctx),
+                )
+                    .await?;
+
+                // upload files to real object store
+                let upload_span = span.child("upload_objects");
+                let created_file_params = upload_files_to_object_store(
+                    created_file_params,
+                    Arc::<dyn Scratchpad>::clone(&scratchpad_ctx),
+                ).await;
+                drop(upload_span);
+
+                let created_file_paths: Vec<ParquetFilePath> = created_file_params
+                    .iter()
+                    .map(ParquetFilePath::from)
+                    .collect();
+
+                // conditionally (if not shaddow mode) remove the newly created files from the scratchpad.
+                scratchpad_ctx
+                    .clean_written_from_scratchpad(&created_file_paths)
+                    .await;
+
+                // Update the catalog to reflect the newly created files, soft delete the compacted
+                // files and update the upgraded files
+                let (created_files, upgraded_files) = update_catalog(
+                    Arc::clone(&components),
+                    job.clone(),
+                    &saved_parquet_file_state,
+                    &files_to_delete,
+                    Vec::new(),
+                    created_file_params,
+                    CompactionLevel::Final,
+                ).await?;
+
+                // Broadcast the compaction event to gossip peers.
+                gossip_compaction_complete(
+                    gossip_handle.as_deref(),
+                    &created_files,
+                    &upgraded_files,
+                    files_to_delete,
+                    CompactionLevel::Final,
+                );
+            }
+
+        }
     }
+    return Ok(());
 }
 
 /// Compact or split given files

@@ -86,6 +86,7 @@ pub fn log_components(components: &Components) {
         partition_info_source,
         partition_files_source,
         round_info_source,
+        tiered_round_info_source,
         partition_filter,
         post_classification_partition_filter: partition_too_large_to_compact_filter,
         compaction_job_done_sink,
